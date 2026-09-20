@@ -1,15 +1,19 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use indicatif::ProgressBar;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+use super::bencode::{self, Value};
 use super::{FileWriter, PieceManager};
 
 const BLOCK_SIZE: u32 = 16384;
 const PIPELINE_DEPTH: u32 = 5;
+const METADATA_PIECE_SIZE: usize = 16384;
+const UT_METADATA_ID: u8 = 1;
 
 struct PieceGuard {
     index: Option<u32>,
@@ -103,11 +107,11 @@ pub async fn run(
     let mut wr = wr;
 
     send_handshake(&mut wr, &info_hash, &our_peer_id).await?;
-    let (recv_hash, _) = tokio::time::timeout(Duration::from_secs(10), recv_handshake(&mut rd))
+    let hs = tokio::time::timeout(Duration::from_secs(10), recv_handshake(&mut rd))
         .await
         .map_err(|_| anyhow::anyhow!("handshake timeout"))??;
 
-    if recv_hash != info_hash {
+    if hs.info_hash != info_hash {
         bail!("info_hash mismatch");
     }
 
@@ -330,7 +334,9 @@ async fn send_handshake(
     let mut msg = Vec::with_capacity(68);
     msg.push(19);
     msg.extend_from_slice(b"BitTorrent protocol");
-    msg.extend_from_slice(&[0u8; 8]);
+    let mut reserved = [0u8; 8];
+    reserved[5] |= 0x10; // BEP 10: extension protocol
+    msg.extend_from_slice(&reserved);
     msg.extend_from_slice(info_hash);
     msg.extend_from_slice(peer_id);
     wr.write_all(&msg).await?;
@@ -338,7 +344,13 @@ async fn send_handshake(
     Ok(())
 }
 
-async fn recv_handshake(rd: &mut (impl AsyncReadExt + Unpin)) -> Result<([u8; 20], [u8; 20])> {
+struct Handshake {
+    info_hash: [u8; 20],
+    _peer_id: [u8; 20],
+    supports_extensions: bool,
+}
+
+async fn recv_handshake(rd: &mut (impl AsyncReadExt + Unpin)) -> Result<Handshake> {
     let pstrlen = rd.read_u8().await?;
     if pstrlen != 19 {
         bail!("invalid protocol string length: {pstrlen}");
@@ -354,5 +366,191 @@ async fn recv_handshake(rd: &mut (impl AsyncReadExt + Unpin)) -> Result<([u8; 20
     rd.read_exact(&mut info_hash).await?;
     let mut peer_id = [0u8; 20];
     rd.read_exact(&mut peer_id).await?;
-    Ok((info_hash, peer_id))
+    Ok(Handshake {
+        info_hash,
+        _peer_id: peer_id,
+        supports_extensions: reserved[5] & 0x10 != 0,
+    })
+}
+
+// --- BEP 9/10: Metadata exchange ---
+
+pub async fn fetch_metadata(
+    addr: SocketAddr,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+) -> Result<Vec<u8>> {
+    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timeout"))??;
+
+    let (rd, wr) = tokio::io::split(stream);
+    let mut rd = BufReader::new(rd);
+    let mut wr = wr;
+
+    send_handshake(&mut wr, &info_hash, &peer_id).await?;
+    let hs = tokio::time::timeout(Duration::from_secs(10), recv_handshake(&mut rd))
+        .await
+        .map_err(|_| anyhow::anyhow!("handshake timeout"))??;
+
+    if hs.info_hash != info_hash {
+        bail!("info_hash mismatch");
+    }
+    if !hs.supports_extensions {
+        bail!("peer does not support extension protocol");
+    }
+
+    send_ext_handshake(&mut wr).await?;
+
+    let mut remote_ut_metadata: Option<u8> = None;
+    let mut metadata_size: Option<usize> = None;
+    let mut pieces: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut requested_up_to: usize = 0;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("metadata download timeout");
+        }
+
+        let msg = tokio::time::timeout(remaining, read_msg_raw(&mut rd))
+            .await
+            .map_err(|_| anyhow::anyhow!("metadata read timeout"))??;
+
+        if msg.is_empty() {
+            continue;
+        }
+
+        let id = msg[0];
+        let payload = &msg[1..];
+
+        if id == 20 {
+            if payload.is_empty() {
+                continue;
+            }
+            let ext_id = payload[0];
+            let ext_payload = &payload[1..];
+
+            if ext_id == 0 {
+                let val = bencode::decode(ext_payload)
+                    .context("failed to decode extension handshake")?;
+                let dict = val.as_dict().context("ext handshake not a dict")?;
+
+                if let Some(m) = dict.get("m").and_then(|v| v.as_dict()) {
+                    if let Some(id) = m.get("ut_metadata").and_then(|v| v.as_int()) {
+                        remote_ut_metadata = Some(id as u8);
+                    }
+                }
+                if let Some(size) = dict.get("metadata_size").and_then(|v| v.as_int()) {
+                    metadata_size = Some(size as usize);
+                }
+
+                if let (Some(ut_id), Some(size)) = (remote_ut_metadata, metadata_size) {
+                    if size == 0 || size > 10 * 1024 * 1024 {
+                        bail!("invalid metadata_size: {size}");
+                    }
+                    let num_pieces = size.div_ceil(METADATA_PIECE_SIZE);
+                    pieces.resize(num_pieces, None);
+                    for i in requested_up_to..num_pieces {
+                        send_metadata_request(&mut wr, ut_id, i as u32).await?;
+                    }
+                    requested_up_to = num_pieces;
+                }
+            } else if remote_ut_metadata.is_some_and(|ut| ext_id == ut) {
+                if let Some(total_size) = metadata_size {
+                    if let Some((piece_idx, piece_data)) =
+                        parse_metadata_data(ext_payload, total_size)
+                    {
+                        if piece_idx < pieces.len() {
+                            pieces[piece_idx] = Some(piece_data);
+                        }
+
+                        if pieces.iter().all(|p| p.is_some()) {
+                            let mut assembled = Vec::with_capacity(total_size);
+                            for p in &pieces {
+                                assembled.extend_from_slice(p.as_ref().unwrap());
+                            }
+                            assembled.truncate(total_size);
+
+                            use sha1::{Digest, Sha1};
+                            let hash = Sha1::digest(&assembled);
+                            if hash.as_slice() != info_hash {
+                                bail!("metadata hash mismatch");
+                            }
+                            return Ok(assembled);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_ext_handshake(wr: &mut (impl AsyncWriteExt + Unpin)) -> Result<()> {
+    let mut m = BTreeMap::new();
+    m.insert(
+        "ut_metadata".to_string(),
+        Value::Int(UT_METADATA_ID as i64),
+    );
+
+    let mut hs = BTreeMap::new();
+    hs.insert("m".to_string(), Value::Dict(m));
+
+    let payload = bencode::encode(&Value::Dict(hs));
+    let mut msg = Vec::with_capacity(2 + payload.len());
+    msg.push(0); // extension handshake ID
+    msg.extend_from_slice(&payload);
+    send_msg(wr, 20, &msg).await
+}
+
+async fn send_metadata_request(
+    wr: &mut (impl AsyncWriteExt + Unpin),
+    ut_metadata_id: u8,
+    piece: u32,
+) -> Result<()> {
+    let mut req = BTreeMap::new();
+    req.insert("msg_type".to_string(), Value::Int(0));
+    req.insert("piece".to_string(), Value::Int(piece as i64));
+
+    let payload = bencode::encode(&Value::Dict(req));
+    let mut msg = Vec::with_capacity(1 + payload.len());
+    msg.push(ut_metadata_id);
+    msg.extend_from_slice(&payload);
+    send_msg(wr, 20, &msg).await
+}
+
+fn parse_metadata_data(payload: &[u8], total_size: usize) -> Option<(usize, Vec<u8>)> {
+    let (val, consumed) = bencode::decode_at(payload, 0).ok()?;
+    let dict = val.as_dict()?;
+    let msg_type = dict.get("msg_type").and_then(|v| v.as_int())?;
+    if msg_type != 1 {
+        return None;
+    }
+    let piece = dict.get("piece").and_then(|v| v.as_int())? as usize;
+    let data = payload[consumed..].to_vec();
+
+    let expected_len = if (piece + 1) * METADATA_PIECE_SIZE > total_size {
+        total_size - piece * METADATA_PIECE_SIZE
+    } else {
+        METADATA_PIECE_SIZE
+    };
+    if data.len() != expected_len {
+        return None;
+    }
+    Some((piece, data))
+}
+
+async fn read_msg_raw(rd: &mut (impl AsyncReadExt + Unpin)) -> Result<Vec<u8>> {
+    let length = rd.read_u32().await?;
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    if length > 1 << 24 {
+        bail!("message too large: {length}");
+    }
+    let mut data = vec![0u8; length as usize];
+    rd.read_exact(&mut data).await?;
+    Ok(data)
 }

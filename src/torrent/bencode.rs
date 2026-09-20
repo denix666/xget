@@ -48,6 +48,10 @@ pub fn decode(data: &[u8]) -> Result<Value> {
     Ok(value)
 }
 
+pub fn decode_at(data: &[u8], pos: usize) -> Result<(Value, usize)> {
+    decode_value(data, pos)
+}
+
 pub fn find_dict_value_raw<'a>(data: &'a [u8], key: &str) -> Result<&'a [u8]> {
     if data.is_empty() || data[0] != b'd' {
         bail!("not a bencoded dictionary");
@@ -137,4 +141,42 @@ fn decode_dict(data: &[u8], pos: usize) -> Result<(Value, usize)> {
         bail!("unterminated dict");
     }
     Ok((Value::Dict(map), p + 1))
+}
+
+pub fn encode(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_into(value, &mut out);
+    out
+}
+
+fn encode_into(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Int(i) => {
+            out.push(b'i');
+            out.extend_from_slice(i.to_string().as_bytes());
+            out.push(b'e');
+        }
+        Value::Bytes(b) => {
+            out.extend_from_slice(b.len().to_string().as_bytes());
+            out.push(b':');
+            out.extend_from_slice(b);
+        }
+        Value::List(items) => {
+            out.push(b'l');
+            for item in items {
+                encode_into(item, out);
+            }
+            out.push(b'e');
+        }
+        Value::Dict(map) => {
+            out.push(b'd');
+            for (key, val) in map {
+                out.extend_from_slice(key.len().to_string().as_bytes());
+                out.push(b':');
+                out.extend_from_slice(key.as_bytes());
+                encode_into(val, out);
+            }
+            out.push(b'e');
+        }
+    }
 }

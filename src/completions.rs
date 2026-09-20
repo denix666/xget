@@ -29,6 +29,8 @@ _xget() {
             return 0
             ;;
         -o|--output|-i|--input)
+            compopt -o filenames
+            local IFS=$'\n'
             COMPREPLY=($(compgen -f -- "$cur"))
             return 0
             ;;
@@ -41,10 +43,12 @@ _xget() {
     if [[ "$cur" == -* ]]; then
         COMPREPLY=($(compgen -W "--help --version --threads --output --input --history --clear-history --reget --completions" -- "$cur"))
     else
+        compopt -o filenames
+        local IFS=$'\n'
         COMPREPLY=($(compgen -f -- "$cur"))
     fi
 }
-complete -o filenames -F _xget xget
+complete -o bashdefault -F _xget xget
 "#;
 
 const ZSH: &str = r#"

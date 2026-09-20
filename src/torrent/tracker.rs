@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 
 use super::bencode;
+use super::dht;
 use super::metainfo::Torrent;
 
 pub async fn get_peers(torrent: &Torrent, peer_id: &[u8; 20]) -> Result<Vec<SocketAddr>> {
@@ -49,6 +50,83 @@ pub async fn get_peers(torrent: &Torrent, peer_id: &[u8; 20]) -> Result<Vec<Sock
         }
     }
 
+    if all_peers.len() < 50 {
+        eprintln!("  DHT: searching for peers...");
+        match dht::find_peers(&torrent.info_hash).await {
+            Ok(dht_peers) => {
+                let before = all_peers.len();
+                for addr in dht_peers {
+                    if seen.insert(addr) {
+                        all_peers.push(addr);
+                    }
+                }
+                let added = all_peers.len() - before;
+                if added > 0 {
+                    eprintln!("  DHT: found {added} new peers");
+                }
+            }
+            Err(e) => eprintln!("  DHT: {e:#}"),
+        }
+    }
+
+    Ok(all_peers)
+}
+
+pub async fn get_peers_for_hash(
+    info_hash: &[u8; 20],
+    trackers: &[String],
+    peer_id: &[u8; 20],
+    total_size: u64,
+) -> Result<Vec<SocketAddr>> {
+    let mut all_peers = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for tracker_url in trackers {
+        let result = if tracker_url.starts_with("udp://") {
+            udp_announce(tracker_url, info_hash, peer_id, total_size).await
+        } else if tracker_url.starts_with("http://") || tracker_url.starts_with("https://") {
+            http_announce(tracker_url, info_hash, peer_id, total_size).await
+        } else {
+            continue;
+        };
+
+        match result {
+            Ok(peers) => {
+                for addr in peers {
+                    if seen.insert(addr) {
+                        all_peers.push(addr);
+                    }
+                }
+                if all_peers.len() >= 50 {
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("  tracker {tracker_url}: {e:#}");
+                continue;
+            }
+        }
+    }
+
+    if all_peers.len() < 50 {
+        eprintln!("  DHT: searching for peers...");
+        match dht::find_peers(info_hash).await {
+            Ok(dht_peers) => {
+                let before = all_peers.len();
+                for addr in dht_peers {
+                    if seen.insert(addr) {
+                        all_peers.push(addr);
+                    }
+                }
+                let added = all_peers.len() - before;
+                if added > 0 {
+                    eprintln!("  DHT: found {added} new peers");
+                }
+            }
+            Err(e) => eprintln!("  DHT: {e:#}"),
+        }
+    }
+
     Ok(all_peers)
 }
 
@@ -72,6 +150,9 @@ async fn http_announce(
         .build()?;
 
     let body = client.get(&url).send().await?.bytes().await?;
+    if body.first() == Some(&b'<') {
+        bail!("tracker returned HTML (likely authentication/passkey required)");
+    }
     let value = bencode::decode(&body).context("failed to decode tracker response")?;
     let dict = value.as_dict().context("tracker response is not a dict")?;
 

@@ -46,7 +46,16 @@ async fn main() -> Result<()> {
         .build()?;
 
     for url in &urls {
-        let (result, hist_output, hist_size) = if is_local_torrent(url) {
+        let (result, hist_output, hist_size) = if url.starts_with("magnet:") {
+            let output_dir = args.output.clone().unwrap_or_else(default_download_dir);
+            println!("{url}");
+            let r = torrent::download_magnet(url, &output_dir, args.threads).await;
+            let out_name = match &r {
+                Ok(name) => output_dir.join(name).display().to_string(),
+                Err(_) => output_dir.display().to_string(),
+            };
+            (r.map(|_| ()), out_name, None)
+        } else if is_local_torrent(url) {
             let output_dir = args.output.clone().unwrap_or_else(default_download_dir);
             println!("{url}");
             let r = torrent::download(std::path::Path::new(url), &output_dir, args.threads).await;

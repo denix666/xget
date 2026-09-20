@@ -1,9 +1,11 @@
 mod bencode;
+mod dht;
+pub mod magnet;
 mod metainfo;
 mod peer;
 mod tracker;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -322,6 +324,168 @@ fn generate_peer_id() -> [u8; 20] {
     id[..8].copy_from_slice(b"-XG0001-");
     rand::fill(&mut id[8..]);
     id
+}
+
+pub async fn download_magnet(
+    magnet_uri: &str,
+    output_dir: &Path,
+    max_peers: usize,
+) -> Result<String> {
+    let ml = magnet::parse(magnet_uri)?;
+
+    println!("  info_hash: {}", hex_encode(&ml.info_hash));
+    if let Some(ref dn) = ml.display_name {
+        println!("  name: {dn}");
+    }
+
+    let peer_id = generate_peer_id();
+
+    print!("  fetching metadata...");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+
+    let peers = tracker::get_peers_for_hash(&ml.info_hash, &ml.trackers, &peer_id, 0).await?;
+    println!(" {} peers", peers.len());
+
+    if peers.is_empty() {
+        bail!("no peers found for magnet link");
+    }
+
+    let mut metadata = None;
+    let mut tried = 0;
+    for &addr in peers.iter().take(30) {
+        tried += 1;
+        match peer::fetch_metadata(addr, ml.info_hash, peer_id).await {
+            Ok(data) => {
+                metadata = Some(data);
+                break;
+            }
+            Err(_) if tried < 30 => continue,
+            Err(e) => {
+                eprintln!("  metadata from {addr}: {e:#}");
+                continue;
+            }
+        }
+    }
+
+    let info_raw = metadata.context("failed to fetch metadata from any peer")?;
+
+    let torrent_data = {
+        use std::collections::BTreeMap;
+        let info_val = bencode::decode(&info_raw)?;
+        let mut root = BTreeMap::new();
+        root.insert(
+            "announce".to_string(),
+            bencode::Value::Bytes(
+                ml.trackers.first().unwrap_or(&String::new()).as_bytes().to_vec(),
+            ),
+        );
+        if !ml.trackers.is_empty() {
+            let tiers: Vec<bencode::Value> = ml
+                .trackers
+                .iter()
+                .map(|t| {
+                    bencode::Value::List(vec![bencode::Value::Bytes(t.as_bytes().to_vec())])
+                })
+                .collect();
+            root.insert("announce-list".to_string(), bencode::Value::List(tiers));
+        }
+        root.insert("info".to_string(), info_val);
+        bencode::encode(&bencode::Value::Dict(root))
+    };
+
+    let torrent = metainfo::parse(&torrent_data)?;
+    println!("  name: {}", torrent.name);
+    println!(
+        "  size: {} ({} pieces)",
+        format_size(torrent.total_size),
+        torrent.pieces.len()
+    );
+
+    let base = output_dir.join(&torrent.name);
+    prepare_files(&torrent, &base).await?;
+
+    let manager = Arc::new(Mutex::new(PieceManager::new(&torrent)));
+    let writer = Arc::new(FileWriter::new(&torrent, &base));
+    let num_pieces = torrent.pieces.len();
+
+    let mut verified = 0u64;
+    print!("  checking existing data...");
+    std::io::stdout().flush().ok();
+
+    for idx in 0..num_pieces {
+        let (piece_len, expected) = {
+            let mgr = manager.lock().unwrap();
+            (mgr.piece_size(idx as u32) as usize, mgr.piece_hash(idx as u32))
+        };
+        if let Ok(data) = writer.read_piece(idx as u32, piece_len).await
+            && data.len() == piece_len
+            && verify_sha1(&data, &expected)
+        {
+            manager.lock().unwrap().piece_done(idx as u32);
+            verified += piece_len as u64;
+        }
+    }
+
+    if verified > 0 {
+        let done = manager.lock().unwrap().completed_count();
+        println!(" {}/{} pieces ({}) verified", done, num_pieces, format_size(verified));
+    } else {
+        println!(" fresh download");
+    }
+
+    if manager.lock().unwrap().is_complete() {
+        println!("  already complete");
+        return Ok(torrent.name.clone());
+    }
+
+    let pb = crate::progress::create(Some(torrent.total_size));
+    pb.inc(verified);
+
+    let concurrent = max_peers.max(30).min(peers.len());
+    let mut next_peer = 0usize;
+    let mut set = tokio::task::JoinSet::new();
+
+    for &addr in peers.iter().take(concurrent) {
+        let ih = torrent.info_hash;
+        let pid = peer_id;
+        let mgr = manager.clone();
+        let wr = writer.clone();
+        let p = pb.clone();
+        set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p).await });
+        next_peer += 1;
+    }
+
+    while let Some(_result) = set.join_next().await {
+        if manager.lock().unwrap().is_complete() {
+            set.abort_all();
+            break;
+        }
+        while set.len() < concurrent && next_peer < peers.len() {
+            let addr = peers[next_peer];
+            next_peer += 1;
+            let ih = torrent.info_hash;
+            let pid = peer_id;
+            let mgr = manager.clone();
+            let wr = writer.clone();
+            let p = pb.clone();
+            set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p).await });
+        }
+    }
+
+    if manager.lock().unwrap().is_complete() {
+        pb.finish_with_message("done");
+        Ok(torrent.name.clone())
+    } else {
+        let done = manager.lock().unwrap().completed_count();
+        let total = manager.lock().unwrap().num_pieces();
+        pb.abandon_with_message("incomplete");
+        bail!("download incomplete: {done}/{total} pieces")
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn format_size(bytes: u64) -> String {
