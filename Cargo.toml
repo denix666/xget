@@ -1,0 +1,32 @@
+
+[package]
+name = "xget"
+version = "1.0.0"
+edition = "2024"
+authors = ["Denis Salmanovich"]
+readme = "README.md"
+description = "A universal CLI downloader written in Rust."
+repository = "https://github.com/denix666/xget"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+dirs = "7"
+futures = "0.3"
+indicatif = "0.18"
+rand = "0.10"
+reqwest = { version = "0.13", features = ["stream"] }
+serde = { version = "1", features = ["derive"] }
+sha1 = "0.11"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

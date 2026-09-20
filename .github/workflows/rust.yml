@@ -1,0 +1,29 @@
+name: Build
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  linux_build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cargo build --release
+
+    - shell: bash
+      run: |
+        mv target/release/xget xget
+        chmod 777 xget
+        tar cpfz xget_linux_x86_64.tar.gz xget
+
+    - name: Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: xget_linux_x86_64.tar.gz
