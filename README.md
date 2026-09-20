@@ -9,7 +9,9 @@ A universal CLI downloader written in Rust. Downloads files over HTTP/HTTPS, FTP
 ## Features
 - **HTTP/HTTPS** — segmented parallel downloads using Range requests
 - **FTP** — async client with passive mode and NAT traversal
-- **BitTorrent** — full protocol implementation
+- **BitTorrent** — `.torrent` files and `magnet:` links
+- **DHT** — peer discovery via Distributed Hash Table (BEP 5)
+- **Metadata exchange** — download torrent metadata from peers (BEP 9/10)
 - **Resume** — automatically resumes interrupted downloads for all protocols
 - **Download history** — JSONL-based log with shell tab-completion for re-downloading
 - **Batch downloads** — read URL lists from a text file
@@ -41,6 +43,9 @@ xget ftp://ftp.example.com/pub/file.tar.gz
 # Download a torrent
 xget /path/to/file.torrent -o /tmp/downloads/ -t 10
 
+# Download via magnet link
+xget "magnet:?xt=urn:btih:..."
+
 # Download multiple URLs from a file
 xget -i urls.txt -o /tmp/downloads/
 
@@ -48,7 +53,7 @@ xget -i urls.txt -o /tmp/downloads/
 xget --history
 
 # Re-download a file from history
-xget --rexget https://example.com/file.tar.gz
+xget --reget https://example.com/file.tar.gz
 ```
 
 ### URL list file format
@@ -66,15 +71,18 @@ https://example.com/report.pdf
 
 ### BitTorrent
 
-Pass a `.torrent` file path as the argument. The downloader operates in **outbound-only** mode:
+Pass a `.torrent` file path or a `magnet:` link as the argument. The downloader operates in **outbound-only** mode:
 
 - Announces `port=0` to trackers (no incoming connections)
 - Never opens a listening socket
+- DHT works in passive mode — queries other nodes but does not accept incoming requests
 - Does not seed after download completes
 
 This makes it safe to use on networks where torrent servers are not allowed.
 
-Supported tracker protocols: HTTP, HTTPS, UDP (BEP 15).
+**Peer discovery:** HTTP/HTTPS trackers, UDP trackers (BEP 15), DHT (BEP 5).
+
+**Magnet links:** peers are found via trackers (if present in the link) and DHT. Torrent metadata is fetched from peers using the extension protocol (BEP 10) and metadata exchange (BEP 9).
 
 ## Options
 
