@@ -7,8 +7,35 @@ mod tracker;
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+pub struct SpeedTracker {
+    total_bytes: AtomicU64,
+    start: std::time::Instant,
+}
+
+impl SpeedTracker {
+    fn new() -> Self {
+        Self {
+            total_bytes: AtomicU64::new(0),
+            start: std::time::Instant::now(),
+        }
+    }
+
+    pub fn add_bytes(&self, n: u64) {
+        self.total_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn average_speed(&self) -> f64 {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        if elapsed < 1.0 {
+            return 0.0;
+        }
+        self.total_bytes.load(Ordering::Relaxed) as f64 / elapsed
+    }
+}
 
 pub async fn download(torrent_path: &Path, output_dir: &Path, max_peers: usize) -> Result<()> {
     let data = tokio::fs::read(torrent_path).await?;
@@ -71,6 +98,7 @@ pub async fn download(torrent_path: &Path, output_dir: &Path, max_peers: usize) 
         bail!("no peers found");
     }
 
+    let speed = Arc::new(SpeedTracker::new());
     let concurrent = max_peers.max(30).min(peers.len());
     let mut next_peer = 0usize;
     let mut set = tokio::task::JoinSet::new();
@@ -81,7 +109,8 @@ pub async fn download(torrent_path: &Path, output_dir: &Path, max_peers: usize) 
         let mgr = manager.clone();
         let wr = writer.clone();
         let p = pb.clone();
-        set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p).await });
+        let sp = speed.clone();
+        set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p, sp).await });
         next_peer += 1;
     }
 
@@ -98,7 +127,8 @@ pub async fn download(torrent_path: &Path, output_dir: &Path, max_peers: usize) 
             let mgr = manager.clone();
             let wr = writer.clone();
             let p = pb.clone();
-            set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p).await });
+            let sp = speed.clone();
+            set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p, sp).await });
         }
     }
 
@@ -442,6 +472,7 @@ pub async fn download_magnet(
     let pb = crate::progress::create(Some(torrent.total_size));
     pb.inc(verified);
 
+    let speed = Arc::new(SpeedTracker::new());
     let concurrent = max_peers.max(30).min(peers.len());
     let mut next_peer = 0usize;
     let mut set = tokio::task::JoinSet::new();
@@ -452,7 +483,8 @@ pub async fn download_magnet(
         let mgr = manager.clone();
         let wr = writer.clone();
         let p = pb.clone();
-        set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p).await });
+        let sp = speed.clone();
+        set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p, sp).await });
         next_peer += 1;
     }
 
@@ -469,7 +501,8 @@ pub async fn download_magnet(
             let mgr = manager.clone();
             let wr = writer.clone();
             let p = pb.clone();
-            set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p).await });
+            let sp = speed.clone();
+            set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p, sp).await });
         }
     }
 

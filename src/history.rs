@@ -39,11 +39,25 @@ pub fn save(entry: &Entry) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let mut sanitized = entry.url.clone();
+    if let Ok(mut parsed) = url::Url::parse(&entry.url) {
+        if !parsed.password().unwrap_or("").is_empty() {
+            let _ = parsed.set_password(Some("***"));
+            sanitized = parsed.to_string();
+        }
+    }
+    let safe_entry = Entry {
+        url: sanitized,
+        output: entry.output.clone(),
+        size: entry.size,
+        timestamp: entry.timestamp.clone(),
+        status: entry.status.clone(),
+    };
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
-    writeln!(file, "{}", serde_json::to_string(entry)?)?;
+    writeln!(file, "{}", serde_json::to_string(&safe_entry)?)?;
     Ok(())
 }
 

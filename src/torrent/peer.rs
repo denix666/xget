@@ -6,14 +6,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 
 use super::bencode::{self, Value};
-use super::{FileWriter, PieceManager};
+use super::{FileWriter, PieceManager, SpeedTracker};
 
 const BLOCK_SIZE: u32 = 16384;
-const PIPELINE_DEPTH: u32 = 5;
+const PIPELINE_DEPTH: u32 = 16;
 const METADATA_PIECE_SIZE: usize = 16384;
 const UT_METADATA_ID: u8 = 1;
+const WARMUP_SECS: f64 = 15.0;
+const MIN_SPEED_BPS: f64 = 10_000.0;
+const SPEED_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 struct PieceGuard {
     index: Option<u32>,
@@ -92,6 +96,7 @@ pub async fn run(
     manager: Arc<Mutex<PieceManager>>,
     writer: Arc<FileWriter>,
     pb: ProgressBar,
+    speed: Arc<SpeedTracker>,
 ) -> Result<()> {
     let mut guard = PieceGuard {
         index: None,
@@ -101,6 +106,7 @@ pub async fn run(
     let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("connect timeout"))??;
+    stream.set_nodelay(true)?;
 
     let (rd, wr) = tokio::io::split(stream);
     let mut rd = BufReader::new(rd);
@@ -120,7 +126,11 @@ pub async fn run(
     let mut choked = true;
     let mut current: Option<PieceDownload> = None;
     let mut got_data = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    let mut peer_bytes: u64 = 0;
+    let mut peer_start: Option<Instant> = None;
+    let mut last_speed_check = Instant::now();
 
     send_msg(&mut wr, 2, &[]).await?;
 
@@ -130,9 +140,9 @@ pub async fn run(
         }
 
         let read_timeout = if got_data {
-            Duration::from_secs(120)
+            Duration::from_secs(60)
         } else {
-            deadline.saturating_duration_since(tokio::time::Instant::now())
+            deadline.saturating_duration_since(Instant::now())
         };
         if read_timeout.is_zero() {
             bail!("no data received within 30s");
@@ -183,11 +193,34 @@ pub async fn run(
                 let mut done = false;
                 got_data = true;
 
+                if peer_start.is_none() {
+                    peer_start = Some(Instant::now());
+                }
+                peer_bytes += len;
+                speed.add_bytes(len);
+
                 if let Some(piece) = current.as_mut()
                     && piece.index == index
                 {
                     done = piece.add_block(begin, data);
                     pb.inc(len);
+                }
+
+                if let Some(start) = peer_start {
+                    if last_speed_check.elapsed() >= SPEED_CHECK_INTERVAL {
+                        last_speed_check = Instant::now();
+                        let elapsed = start.elapsed().as_secs_f64();
+                        if elapsed > WARMUP_SECS {
+                            let peer_speed = peer_bytes as f64 / elapsed;
+                            let avg_speed = speed.average_speed();
+                            if avg_speed > 50_000.0 && peer_speed < avg_speed * 0.15 {
+                                bail!("slow peer: {:.0} B/s (avg {:.0} B/s)", peer_speed, avg_speed);
+                            }
+                            if peer_speed < MIN_SPEED_BPS {
+                                bail!("peer below minimum speed: {:.0} B/s", peer_speed);
+                            }
+                        }
+                    }
                 }
 
                 if done {
@@ -242,13 +275,21 @@ async fn flush_requests(
     current: &mut Option<PieceDownload>,
 ) -> Result<()> {
     if let Some(piece) = current.as_mut() {
-        for (index, begin, length) in piece.pending_requests() {
-            let mut payload = Vec::with_capacity(12);
-            payload.extend_from_slice(&index.to_be_bytes());
-            payload.extend_from_slice(&begin.to_be_bytes());
-            payload.extend_from_slice(&length.to_be_bytes());
-            send_msg(wr, 6, &payload).await?;
+        let reqs = piece.pending_requests();
+        if reqs.is_empty() {
+            return Ok(());
         }
+        // 17 bytes per request: 4 (length) + 1 (id) + 4+4+4 (index, begin, len)
+        let mut buf = Vec::with_capacity(reqs.len() * 17);
+        for (index, begin, length) in reqs {
+            buf.extend_from_slice(&13u32.to_be_bytes());
+            buf.push(6);
+            buf.extend_from_slice(&index.to_be_bytes());
+            buf.extend_from_slice(&begin.to_be_bytes());
+            buf.extend_from_slice(&length.to_be_bytes());
+        }
+        wr.write_all(&buf).await?;
+        wr.flush().await?;
     }
     Ok(())
 }
@@ -317,11 +358,11 @@ async fn read_msg(rd: &mut (impl AsyncReadExt + Unpin)) -> Result<Msg> {
 
 async fn send_msg(wr: &mut (impl AsyncWriteExt + Unpin), id: u8, payload: &[u8]) -> Result<()> {
     let length = (1 + payload.len()) as u32;
-    wr.write_u32(length).await?;
-    wr.write_u8(id).await?;
-    if !payload.is_empty() {
-        wr.write_all(payload).await?;
-    }
+    let mut buf = Vec::with_capacity(5 + payload.len());
+    buf.extend_from_slice(&length.to_be_bytes());
+    buf.push(id);
+    buf.extend_from_slice(payload);
+    wr.write_all(&buf).await?;
     wr.flush().await?;
     Ok(())
 }
