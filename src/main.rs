@@ -5,6 +5,7 @@ mod history;
 mod http;
 mod progress;
 mod resume;
+mod ssh;
 mod torrent;
 
 use anyhow::{Result, bail};
@@ -60,6 +61,27 @@ async fn main() -> Result<()> {
             println!("{url}");
             let r = torrent::download(std::path::Path::new(url), &output_dir, args.threads).await;
             (r, output_dir.display().to_string(), None)
+        } else if ssh::is_ssh_target(url) {
+            let target = ssh::parse(url)?;
+            let filename = target.filename().to_string();
+            let output = if let Some(ref out) = args.output {
+                if out.is_dir() || out.to_string_lossy().ends_with('/') {
+                    out.join(&filename)
+                } else {
+                    out.clone()
+                }
+            } else {
+                default_download_dir().join(&filename)
+            };
+            println!("{}", target.display_url());
+            println!("  -> {}", output.display());
+            let r = ssh::download(&target, &output).await;
+            let size = if r.is_ok() {
+                tokio::fs::metadata(&output).await.ok().map(|m| m.len())
+            } else {
+                None
+            };
+            (r, output.display().to_string(), size)
         } else {
             let output = resolve_output(url, &args, is_batch)?;
             if let Some(parent) = output.parent() {

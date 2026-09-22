@@ -42,7 +42,7 @@ pub fn save(entry: &Entry) -> Result<()> {
     let mut sanitized = entry.url.clone();
     if let Ok(mut parsed) = url::Url::parse(&entry.url) {
         if !parsed.password().unwrap_or("").is_empty() {
-            let _ = parsed.set_password(Some("***"));
+            let _ = parsed.set_password(None);
             sanitized = parsed.to_string();
         }
     }

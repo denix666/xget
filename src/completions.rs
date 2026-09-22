@@ -19,9 +19,9 @@ _xget() {
 
     case "$prev" in
         --reget)
-            local urls
-            urls=$(xget --history-urls 2>/dev/null)
-            COMPREPLY=($(compgen -W "$urls" -- "$cur"))
+            compopt -o filenames
+            local IFS=$'\n'
+            COMPREPLY=($(compgen -W "$(xget --history-urls 2>/dev/null)" -- "$cur"))
             return 0
             ;;
         --completions)
@@ -90,7 +90,7 @@ complete -c xget -s o -l output -d "Output path" -rF
 complete -c xget -s i -l input -d "Input file" -rF
 complete -c xget -l history -d "Show download history"
 complete -c xget -l clear-history -d "Clear download history"
-complete -c xget -l reget -d "Re-download from history" -x -a "(xget --history-urls 2>/dev/null)"
+complete -c xget -l reget -d "Re-download from history" -x -a "(xget --history-urls 2>/dev/null | string collect -N)"
 complete -c xget -l completions -d "Generate completions" -x -a "bash zsh fish"
 complete -c xget -n '__fish_is_first_arg' -F -d "File to download"
 "#;
