@@ -6,8 +6,9 @@ use tokio::net::UdpSocket;
 use super::bencode;
 use super::dht;
 use super::metainfo::Torrent;
+use crate::log::vlog;
 
-pub async fn get_peers(torrent: &Torrent, peer_id: &[u8; 20]) -> Result<Vec<SocketAddr>> {
+pub fn collect_trackers(torrent: &Torrent) -> Vec<String> {
     let mut trackers = Vec::new();
     if !torrent.announce.is_empty() {
         trackers.push(torrent.announce.clone());
@@ -19,57 +20,7 @@ pub async fn get_peers(torrent: &Torrent, peer_id: &[u8; 20]) -> Result<Vec<Sock
             }
         }
     }
-
-    let mut all_peers = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for tracker_url in &trackers {
-        let result = if tracker_url.starts_with("udp://") {
-            udp_announce(tracker_url, &torrent.info_hash, peer_id, torrent.total_size).await
-        } else if tracker_url.starts_with("http://") || tracker_url.starts_with("https://") {
-            http_announce(tracker_url, &torrent.info_hash, peer_id, torrent.total_size).await
-        } else {
-            continue;
-        };
-
-        match result {
-            Ok(peers) => {
-                for addr in peers {
-                    if seen.insert(addr) {
-                        all_peers.push(addr);
-                    }
-                }
-                if all_peers.len() >= 50 {
-                    break;
-                }
-            }
-            Err(e) => {
-                eprintln!("  tracker {tracker_url}: {e:#}");
-                continue;
-            }
-        }
-    }
-
-    if all_peers.len() < 50 {
-        eprintln!("  DHT: searching for peers...");
-        match dht::find_peers(&torrent.info_hash).await {
-            Ok(dht_peers) => {
-                let before = all_peers.len();
-                for addr in dht_peers {
-                    if seen.insert(addr) {
-                        all_peers.push(addr);
-                    }
-                }
-                let added = all_peers.len() - before;
-                if added > 0 {
-                    eprintln!("  DHT: found {added} new peers");
-                }
-            }
-            Err(e) => eprintln!("  DHT: {e:#}"),
-        }
-    }
-
-    Ok(all_peers)
+    trackers
 }
 
 pub async fn get_peers_for_hash(
@@ -80,54 +31,118 @@ pub async fn get_peers_for_hash(
 ) -> Result<Vec<SocketAddr>> {
     let mut all_peers = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut set = tokio::task::JoinSet::new();
 
     for tracker_url in trackers {
-        let result = if tracker_url.starts_with("udp://") {
-            udp_announce(tracker_url, info_hash, peer_id, total_size).await
-        } else if tracker_url.starts_with("http://") || tracker_url.starts_with("https://") {
-            http_announce(tracker_url, info_hash, peer_id, total_size).await
-        } else {
-            continue;
-        };
+        let url = tracker_url.clone();
+        let ih = *info_hash;
+        let pid = *peer_id;
+        set.spawn(async move {
+            let result = if url.starts_with("udp://") {
+                udp_announce(&url, &ih, &pid, total_size).await
+            } else if url.starts_with("http://") || url.starts_with("https://") {
+                http_announce(&url, &ih, &pid, total_size).await
+            } else {
+                Ok(Vec::new())
+            };
+            (url, result)
+        });
+    }
 
+    let ih = *info_hash;
+    set.spawn(async move {
+        let result = dht::find_peers(&ih).await;
+        ("DHT".to_string(), result)
+    });
+
+    while let Some(Ok((source, result))) = set.join_next().await {
         match result {
             Ok(peers) => {
+                let count = peers.len();
                 for addr in peers {
                     if seen.insert(addr) {
                         all_peers.push(addr);
                     }
                 }
-                if all_peers.len() >= 50 {
-                    break;
+                if source == "DHT" && count > 0 {
+                    vlog!("  DHT: found {count} peers");
                 }
             }
             Err(e) => {
-                eprintln!("  tracker {tracker_url}: {e:#}");
-                continue;
-            }
-        }
-    }
-
-    if all_peers.len() < 50 {
-        eprintln!("  DHT: searching for peers...");
-        match dht::find_peers(info_hash).await {
-            Ok(dht_peers) => {
-                let before = all_peers.len();
-                for addr in dht_peers {
-                    if seen.insert(addr) {
-                        all_peers.push(addr);
-                    }
-                }
-                let added = all_peers.len() - before;
-                if added > 0 {
-                    eprintln!("  DHT: found {added} new peers");
+                if source == "DHT" {
+                    vlog!("  DHT: {e:#}");
+                } else {
+                    vlog!("  tracker {source}: {e:#}");
                 }
             }
-            Err(e) => eprintln!("  DHT: {e:#}"),
         }
     }
 
     Ok(all_peers)
+}
+
+pub async fn discover_peers(
+    trackers: Vec<String>,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    total_size: u64,
+    tx: tokio::sync::mpsc::Sender<SocketAddr>,
+) {
+    let mut set = tokio::task::JoinSet::new();
+
+    for tracker_url in trackers {
+        let tx = tx.clone();
+        set.spawn(async move {
+            let result = if tracker_url.starts_with("udp://") {
+                udp_announce(&tracker_url, &info_hash, &peer_id, total_size).await
+            } else if tracker_url.starts_with("http://") || tracker_url.starts_with("https://") {
+                http_announce(&tracker_url, &info_hash, &peer_id, total_size).await
+            } else {
+                return;
+            };
+            match result {
+                Ok(peers) => {
+                    for addr in peers {
+                        let _ = tx.send(addr).await;
+                    }
+                }
+                Err(e) => vlog!("  tracker {tracker_url}: {e:#}"),
+            }
+        });
+    }
+
+    let tx_dht = tx.clone();
+    set.spawn(async move {
+        let mut round = 0u32;
+        loop {
+            if round > 0 {
+                let delay = match round {
+                    1..=5 => 20,
+                    6..=10 => 40,
+                    _ => 60,
+                };
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+            }
+            match dht::find_peers(&info_hash).await {
+                Ok(peers) => {
+                    let count = peers.len();
+                    for addr in peers {
+                        if tx_dht.send(addr).await.is_err() {
+                            return;
+                        }
+                    }
+                    if count > 0 {
+                        vlog!("  DHT round {}: found {count} peers", round + 1);
+                    }
+                }
+                Err(e) => vlog!("  DHT: {e:#}"),
+            }
+            round += 1;
+        }
+    });
+
+    drop(tx);
+    while set.join_next().await.is_some() {}
 }
 
 async fn http_announce(

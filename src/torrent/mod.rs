@@ -6,10 +6,14 @@ mod peer;
 mod tracker;
 
 use anyhow::{Context, Result, bail};
+use std::collections::{HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+use crate::log::vlog;
 
 pub struct SpeedTracker {
     total_bytes: AtomicU64,
@@ -58,9 +62,7 @@ pub async fn download(torrent_path: &Path, output_dir: &Path, max_peers: usize) 
     let num_pieces = torrent.pieces.len();
     let mut verified = 0u64;
 
-    print!("  checking existing data...");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
+    vlog!("checking existing data ({num_pieces} pieces)...");
 
     for idx in 0..num_pieces {
         let (piece_len, expected) = {
@@ -78,9 +80,7 @@ pub async fn download(torrent_path: &Path, output_dir: &Path, max_peers: usize) 
 
     if verified > 0 {
         let done = manager.lock().unwrap().completed_count();
-        println!(" {}/{} pieces ({}) verified", done, num_pieces, format_size(verified));
-    } else {
-        println!(" fresh download");
+        vlog!("{done}/{num_pieces} pieces ({}) verified", format_size(verified));
     }
 
     if manager.lock().unwrap().is_complete() {
@@ -88,49 +88,20 @@ pub async fn download(torrent_path: &Path, output_dir: &Path, max_peers: usize) 
         return Ok(());
     }
 
-    let peers = tracker::get_peers(&torrent, &peer_id).await?;
-    println!("  peers: {}", peers.len());
-
     let pb = crate::progress::create(Some(torrent.total_size));
     pb.inc(verified);
 
-    if peers.is_empty() {
-        bail!("no peers found");
-    }
+    let (tx, rx) = tokio::sync::mpsc::channel(200);
+    let trackers = tracker::collect_trackers(&torrent);
+    let ih = torrent.info_hash;
+    let pid = peer_id;
+    let ts = torrent.total_size;
+    let discover_handle = tokio::spawn(async move {
+        tracker::discover_peers(trackers, ih, pid, ts, tx).await;
+    });
 
-    let speed = Arc::new(SpeedTracker::new());
-    let concurrent = max_peers.max(30).min(peers.len());
-    let mut next_peer = 0usize;
-    let mut set = tokio::task::JoinSet::new();
-
-    for &addr in peers.iter().take(concurrent) {
-        let ih = torrent.info_hash;
-        let pid = peer_id;
-        let mgr = manager.clone();
-        let wr = writer.clone();
-        let p = pb.clone();
-        let sp = speed.clone();
-        set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p, sp).await });
-        next_peer += 1;
-    }
-
-    while let Some(_result) = set.join_next().await {
-        if manager.lock().unwrap().is_complete() {
-            set.abort_all();
-            break;
-        }
-        while set.len() < concurrent && next_peer < peers.len() {
-            let addr = peers[next_peer];
-            next_peer += 1;
-            let ih = torrent.info_hash;
-            let pid = peer_id;
-            let mgr = manager.clone();
-            let wr = writer.clone();
-            let p = pb.clone();
-            let sp = speed.clone();
-            set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p, sp).await });
-        }
-    }
+    run_download_stream(rx, torrent.info_hash, peer_id, &manager, &writer, &pb, max_peers).await;
+    discover_handle.abort();
 
     if manager.lock().unwrap().is_complete() {
         pb.finish_with_message("done");
@@ -140,6 +111,122 @@ pub async fn download(torrent_path: &Path, output_dir: &Path, max_peers: usize) 
         let total = manager.lock().unwrap().num_pieces();
         pb.abandon_with_message("incomplete");
         bail!("download incomplete: {done}/{total} pieces")
+    }
+}
+
+async fn run_download_stream(
+    mut rx: tokio::sync::mpsc::Receiver<SocketAddr>,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    manager: &Arc<Mutex<PieceManager>>,
+    writer: &Arc<FileWriter>,
+    pb: &indicatif::ProgressBar,
+    max_peers: usize,
+) {
+    let max_concurrent = max_peers.max(30);
+    let speed = Arc::new(SpeedTracker::new());
+    let pex_peers: Arc<Mutex<VecDeque<SocketAddr>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let mut seen = HashSet::new();
+    let mut pending = VecDeque::new();
+    let mut set = tokio::task::JoinSet::new();
+    let mut channel_open = true;
+
+    let mut ok_count = 0u32;
+    let mut connect_fail = 0u32;
+    let mut no_unchoke = 0u32;
+    let mut no_pieces = 0u32;
+    let mut other_err = 0u32;
+
+    loop {
+        if manager.lock().unwrap().is_complete() {
+            set.abort_all();
+            break;
+        }
+
+        // Drain PEX-discovered peers
+        {
+            let mut pex = pex_peers.lock().unwrap();
+            for addr in pex.drain(..) {
+                if seen.insert(addr) {
+                    pending.push_back(addr);
+                }
+            }
+        }
+
+        // Fill active set from pending queue
+        while set.len() < max_concurrent {
+            if let Some(addr) = pending.pop_front() {
+                let mgr = manager.clone();
+                let wr = writer.clone();
+                let p = pb.clone();
+                let sp = speed.clone();
+                let pp = pex_peers.clone();
+                set.spawn(async move {
+                    let r = peer::run(addr, info_hash, peer_id, mgr, wr, p, sp, pp).await;
+                    (addr, r)
+                });
+            } else {
+                break;
+            }
+        }
+
+        // Show status when idle
+        if set.is_empty() && pending.is_empty() && channel_open {
+            pb.set_message("waiting for peers");
+        } else {
+            pb.set_message("");
+        }
+
+        tokio::select! {
+            result = rx.recv(), if channel_open => {
+                match result {
+                    Some(addr) => {
+                        if seen.insert(addr) {
+                            pending.push_back(addr);
+                        }
+                    }
+                    None => {
+                        channel_open = false;
+                        vlog!("peer discovery finished ({} unique peers)", seen.len());
+                    }
+                }
+            }
+            result = set.join_next(), if !set.is_empty() => {
+                if let Some(join_result) = result {
+                    match join_result {
+                        Ok((_, Ok(()))) => ok_count += 1,
+                        Ok((peer_addr, Err(e))) => {
+                            let msg = format!("{e:#}");
+                            vlog!("  peer {peer_addr}: {msg}");
+                            if msg.contains("connect timeout") || msg.contains("timed out") || msg.contains("refused") {
+                                connect_fail += 1;
+                            } else if msg.contains("unchoke timeout") || msg.contains("no data received") {
+                                no_unchoke += 1;
+                            } else if msg.contains("no needed pieces") {
+                                no_pieces += 1;
+                            } else {
+                                other_err += 1;
+                            }
+                        }
+                        Err(_) => other_err += 1,
+                    }
+
+                    if manager.lock().unwrap().is_complete() {
+                        set.abort_all();
+                        break;
+                    }
+                }
+            }
+            else => break,
+        }
+    }
+
+    pb.set_message("");
+    let total = ok_count + connect_fail + no_unchoke + no_pieces + other_err;
+    if total > 0 {
+        vlog!(
+            "peer stats: {ok_count} ok, {connect_fail} connect fail, {no_unchoke} no unchoke, {no_pieces} no pieces, {other_err} error"
+        );
     }
 }
 
@@ -215,6 +302,12 @@ impl PieceManager {
 
     pub fn completed_count(&self) -> usize {
         self.states.iter().filter(|s| **s == PieceState::Done).count()
+    }
+
+    pub fn has_needed_for(&self, peer_has: &[bool]) -> bool {
+        self.states.iter().enumerate().any(|(i, s)| {
+            *s == PieceState::Needed && peer_has.get(i).copied().unwrap_or(false)
+        })
     }
 }
 
@@ -363,19 +456,17 @@ pub async fn download_magnet(
 ) -> Result<String> {
     let ml = magnet::parse(magnet_uri)?;
 
-    println!("  info_hash: {}", hex_encode(&ml.info_hash));
+    vlog!("info_hash: {}", hex_encode(&ml.info_hash));
     if let Some(ref dn) = ml.display_name {
         println!("  name: {dn}");
     }
 
     let peer_id = generate_peer_id();
 
-    print!("  fetching metadata...");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
+    vlog!("fetching metadata...");
 
     let peers = tracker::get_peers_for_hash(&ml.info_hash, &ml.trackers, &peer_id, 0).await?;
-    println!(" {} peers", peers.len());
+    vlog!("metadata peers: {}", peers.len());
 
     if peers.is_empty() {
         bail!("no peers found for magnet link");
@@ -392,7 +483,7 @@ pub async fn download_magnet(
             }
             Err(_) if tried < 30 => continue,
             Err(e) => {
-                eprintln!("  metadata from {addr}: {e:#}");
+                vlog!("metadata from {addr}: {e:#}");
                 continue;
             }
         }
@@ -440,8 +531,7 @@ pub async fn download_magnet(
     let num_pieces = torrent.pieces.len();
 
     let mut verified = 0u64;
-    print!("  checking existing data...");
-    std::io::stdout().flush().ok();
+    vlog!("checking existing data ({num_pieces} pieces)...");
 
     for idx in 0..num_pieces {
         let (piece_len, expected) = {
@@ -459,9 +549,7 @@ pub async fn download_magnet(
 
     if verified > 0 {
         let done = manager.lock().unwrap().completed_count();
-        println!(" {}/{} pieces ({}) verified", done, num_pieces, format_size(verified));
-    } else {
-        println!(" fresh download");
+        vlog!("{done}/{num_pieces} pieces ({}) verified", format_size(verified));
     }
 
     if manager.lock().unwrap().is_complete() {
@@ -472,39 +560,23 @@ pub async fn download_magnet(
     let pb = crate::progress::create(Some(torrent.total_size));
     pb.inc(verified);
 
-    let speed = Arc::new(SpeedTracker::new());
-    let concurrent = max_peers.max(30).min(peers.len());
-    let mut next_peer = 0usize;
-    let mut set = tokio::task::JoinSet::new();
-
-    for &addr in peers.iter().take(concurrent) {
-        let ih = torrent.info_hash;
-        let pid = peer_id;
-        let mgr = manager.clone();
-        let wr = writer.clone();
-        let p = pb.clone();
-        let sp = speed.clone();
-        set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p, sp).await });
-        next_peer += 1;
-    }
-
-    while let Some(_result) = set.join_next().await {
-        if manager.lock().unwrap().is_complete() {
-            set.abort_all();
-            break;
+    let (tx, rx) = tokio::sync::mpsc::channel(200);
+    let existing = peers;
+    let trackers = tracker::collect_trackers(&torrent);
+    let ih = torrent.info_hash;
+    let pid = peer_id;
+    let ts = torrent.total_size;
+    let discover_handle = tokio::spawn(async move {
+        for addr in existing {
+            if tx.send(addr).await.is_err() {
+                return;
+            }
         }
-        while set.len() < concurrent && next_peer < peers.len() {
-            let addr = peers[next_peer];
-            next_peer += 1;
-            let ih = torrent.info_hash;
-            let pid = peer_id;
-            let mgr = manager.clone();
-            let wr = writer.clone();
-            let p = pb.clone();
-            let sp = speed.clone();
-            set.spawn(async move { peer::run(addr, ih, pid, mgr, wr, p, sp).await });
-        }
-    }
+        tracker::discover_peers(trackers, ih, pid, ts, tx).await;
+    });
+
+    run_download_stream(rx, torrent.info_hash, peer_id, &manager, &writer, &pb, max_peers).await;
+    discover_handle.abort();
 
     if manager.lock().unwrap().is_complete() {
         pb.finish_with_message("done");

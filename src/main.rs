@@ -3,6 +3,7 @@ mod completions;
 mod ftp;
 mod history;
 mod http;
+mod log;
 mod progress;
 mod resume;
 mod ssh;
@@ -15,6 +16,7 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = cli::Args::parse();
+    log::init(args.verbose);
 
     if args.history_urls {
         for url in history::unique_urls()? {

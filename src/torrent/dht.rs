@@ -13,9 +13,9 @@ const BOOTSTRAP_NODES: &[&str] = &[
     "dht.libtorrent.org:25401",
 ];
 
-const MAX_ITERATIONS: usize = 6;
+const MAX_ITERATIONS: usize = 12;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
-const BATCH_SIZE: usize = 8;
+const BATCH_SIZE: usize = 16;
 
 pub async fn find_peers(info_hash: &[u8; 20]) -> Result<Vec<SocketAddr>> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;

@@ -41,7 +41,7 @@ _xget() {
     esac
 
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=($(compgen -W "--help --version --threads --output --input --history --clear-history --reget --completions" -- "$cur"))
+        COMPREPLY=($(compgen -W "--help --version --threads --output --input --history --clear-history --reget --completions --verbose" -- "$cur"))
     else
         compopt -o filenames
         local IFS=$'\n'
@@ -67,6 +67,8 @@ _xget() {
         '--help[Show help]' \
         '-V[Show version]' \
         '--version[Show version]' \
+        '-v[Verbose logging]' \
+        '--verbose[Verbose logging]' \
         '-t[Download threads]:threads:(1 2 4 8 16)' \
         '--threads[Download threads]:threads:(1 2 4 8 16)' \
         '-o[Output path]:output:_files' \
@@ -85,6 +87,7 @@ _xget "$@"
 const FISH: &str = r#"
 complete -c xget -l help -d "Show help"
 complete -c xget -l version -d "Show version"
+complete -c xget -s v -l verbose -d "Verbose logging"
 complete -c xget -s t -l threads -d "Download threads" -x -a "1 2 4 8 16"
 complete -c xget -s o -l output -d "Output path" -rF
 complete -c xget -s i -l input -d "Input file" -rF

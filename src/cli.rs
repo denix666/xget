@@ -38,4 +38,8 @@ pub struct Args {
     /// Print history URLs for shell completion
     #[arg(long, hide = true)]
     pub history_urls: bool,
+
+    /// Enable verbose logging to ~/.local/share/xget/xget.log
+    #[arg(short, long)]
+    pub verbose: bool,
 }

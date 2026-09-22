@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use indicatif::ProgressBar;
-use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -10,11 +10,13 @@ use tokio::time::Instant;
 
 use super::bencode::{self, Value};
 use super::{FileWriter, PieceManager, SpeedTracker};
+use crate::log::vlog;
 
 const BLOCK_SIZE: u32 = 16384;
 const PIPELINE_DEPTH: u32 = 16;
 const METADATA_PIECE_SIZE: usize = 16384;
 const UT_METADATA_ID: u8 = 1;
+const OUR_UT_PEX_ID: u8 = 2;
 const WARMUP_SECS: f64 = 15.0;
 const MIN_SPEED_BPS: f64 = 10_000.0;
 const SPEED_CHECK_INTERVAL: Duration = Duration::from_secs(10);
@@ -97,6 +99,7 @@ pub async fn run(
     writer: Arc<FileWriter>,
     pb: ProgressBar,
     speed: Arc<SpeedTracker>,
+    pex_peers: Arc<Mutex<VecDeque<SocketAddr>>>,
 ) -> Result<()> {
     let mut guard = PieceGuard {
         index: None,
@@ -121,12 +124,18 @@ pub async fn run(
         bail!("info_hash mismatch");
     }
 
+    let mut peer_has_pex = false;
+    if hs.supports_extensions {
+        send_pex_handshake(&mut wr).await?;
+    }
+
     let num_pieces = manager.lock().unwrap().num_pieces();
     let mut peer_has = vec![false; num_pieces];
     let mut choked = true;
     let mut current: Option<PieceDownload> = None;
     let mut got_data = false;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut got_bitfield = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
 
     let mut peer_bytes: u64 = 0;
     let mut peer_start: Option<Instant> = None;
@@ -145,7 +154,7 @@ pub async fn run(
             deadline.saturating_duration_since(Instant::now())
         };
         if read_timeout.is_zero() {
-            bail!("no data received within 30s");
+            bail!("no data received within 60s");
         }
 
         let msg = tokio::time::timeout(read_timeout, read_msg(&mut rd))
@@ -165,6 +174,11 @@ pub async fn run(
                 if !choked {
                     flush_requests(&mut wr, &mut current).await?;
                 }
+                if current.is_none() && got_bitfield
+                    && !manager.lock().unwrap().has_needed_for(&peer_has)
+                {
+                    bail!("no needed pieces");
+                }
             }
             Msg::Have(idx) => {
                 if (idx as usize) < peer_has.len() {
@@ -183,9 +197,15 @@ pub async fn run(
                         *has = (data[byte] >> bit) & 1 == 1;
                     }
                 }
+                got_bitfield = true;
                 if current.is_none() && !choked {
                     try_start(&manager, &peer_has, &mut current, &mut guard);
                     flush_requests(&mut wr, &mut current).await?;
+                    if current.is_none()
+                        && !manager.lock().unwrap().has_needed_for(&peer_has)
+                    {
+                        bail!("no needed pieces");
+                    }
                 }
             }
             Msg::Piece { index, begin, data } => {
@@ -244,8 +264,39 @@ pub async fn run(
                     if !choked {
                         flush_requests(&mut wr, &mut current).await?;
                     }
+                    if current.is_none() {
+                        return Ok(());
+                    }
                 } else if !choked {
                     flush_requests(&mut wr, &mut current).await?;
+                }
+            }
+            Msg::Extended { ext_id, payload } => {
+                if ext_id == 0 {
+                    if let Ok(val) = bencode::decode(&payload) {
+                        if let Some(dict) = val.as_dict() {
+                            if let Some(m) = dict.get("m").and_then(|v| v.as_dict()) {
+                                if m.contains_key("ut_pex") {
+                                    peer_has_pex = true;
+                                }
+                            }
+                        }
+                    }
+                } else if ext_id == OUR_UT_PEX_ID && peer_has_pex {
+                    if let Ok(val) = bencode::decode(&payload) {
+                        if let Some(dict) = val.as_dict() {
+                            if let Some(added) = dict.get("added").and_then(|v| v.as_bytes()) {
+                                let new = parse_pex_peers(added);
+                                if !new.is_empty() {
+                                    vlog!("  PEX from {addr}: {} peers", new.len());
+                                    let mut pex = pex_peers.lock().unwrap();
+                                    for p in new {
+                                        pex.push_back(p);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Msg::Unknown => {}
@@ -309,6 +360,7 @@ enum Msg {
     Have(u32),
     Bitfield(Vec<u8>),
     Piece { index: u32, begin: u32, data: Vec<u8> },
+    Extended { ext_id: u8, payload: Vec<u8> },
     Unknown,
 }
 
@@ -345,6 +397,18 @@ async fn read_msg(rd: &mut (impl AsyncReadExt + Unpin)) -> Result<Msg> {
             let mut data = vec![0u8; payload_len - 8];
             rd.read_exact(&mut data).await?;
             Ok(Msg::Piece { index, begin, data })
+        }
+        20 => {
+            if payload_len == 0 {
+                return Ok(Msg::Unknown);
+            }
+            let ext_id = rd.read_u8().await?;
+            let rest = payload_len - 1;
+            let mut payload = vec![0u8; rest];
+            if rest > 0 {
+                rd.read_exact(&mut payload).await?;
+            }
+            Ok(Msg::Extended { ext_id, payload })
         }
         _ => {
             if payload_len > 0 {
@@ -527,6 +591,32 @@ pub async fn fetch_metadata(
             }
         }
     }
+}
+
+async fn send_pex_handshake(wr: &mut (impl AsyncWriteExt + Unpin)) -> Result<()> {
+    let mut m = BTreeMap::new();
+    m.insert("ut_pex".to_string(), Value::Int(OUR_UT_PEX_ID as i64));
+    let mut hs = BTreeMap::new();
+    hs.insert("m".to_string(), Value::Dict(m));
+    let payload = bencode::encode(&Value::Dict(hs));
+    let mut msg = Vec::with_capacity(1 + payload.len());
+    msg.push(0);
+    msg.extend_from_slice(&payload);
+    send_msg(wr, 20, &msg).await
+}
+
+fn parse_pex_peers(data: &[u8]) -> Vec<SocketAddr> {
+    let mut peers = Vec::new();
+    let mut pos = 0;
+    while pos + 6 <= data.len() {
+        let ip = Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
+        let port = u16::from_be_bytes([data[pos + 4], data[pos + 5]]);
+        if port > 0 {
+            peers.push(SocketAddr::new(IpAddr::V4(ip), port));
+        }
+        pos += 6;
+    }
+    peers
 }
 
 async fn send_ext_handshake(wr: &mut (impl AsyncWriteExt + Unpin)) -> Result<()> {
