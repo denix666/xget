@@ -4,13 +4,15 @@
 This program comes with no warranty. You must use this program at your own risk.
 
 ## Introduction
-A universal CLI downloader written in Rust. Downloads files over HTTP/HTTPS, FTP, and BitTorrent — all from a single command.
+A universal CLI downloader written in Rust. Downloads files over HTTP/HTTPS, FTP, SSH (SCP/SFTP), and BitTorrent — all from a single command.
 
 ## Features
 - **HTTP/HTTPS** — segmented parallel downloads using Range requests
 - **FTP** — async client with passive mode and NAT traversal
+- **SSH (SCP/SFTP)** — download files from remote servers via SSH with password or key-based auth
 - **BitTorrent** — `.torrent` files and `magnet:` links
 - **DHT** — peer discovery via Distributed Hash Table (BEP 5)
+- **PEX** — peer exchange for discovering additional peers from connected ones (BEP 11)
 - **Metadata exchange** — download torrent metadata from peers (BEP 9/10)
 - **Resume** — automatically resumes interrupted downloads for all protocols
 - **Download history** — JSONL-based log with shell tab-completion for re-downloading
@@ -39,6 +41,15 @@ xget https://example.com/large.iso -t 8
 
 # Download via FTP
 xget ftp://ftp.example.com/pub/file.tar.gz
+
+# Download via SSH (SCP-style syntax)
+xget user@host:/path/to/file.tar.gz
+
+# Download via SFTP URL
+xget sftp://user:password@host:22/path/to/file.tar.gz
+
+# Download via SCP URL
+xget scp://user@host/path/to/file.tar.gz
 
 # Download a torrent
 xget /path/to/file.torrent -o /tmp/downloads/ -t 10
@@ -69,6 +80,25 @@ https://example.com/photo2.jpg
 https://example.com/report.pdf
 ```
 
+### SSH (SCP/SFTP)
+
+Download files from remote servers over SSH. Three URL formats are supported:
+
+| Format | Example |
+|---|---|
+| SCP-style | `user@host:/path/to/file` |
+| SFTP URL | `sftp://user@host:22/path/to/file` |
+| SCP URL | `scp://user:password@host/path/to/file` |
+
+**Authentication:** password can be embedded in the URL (`user:password@host`). If no password is provided, key-based authentication is used (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`).
+
+**Port:** defaults to 22. Specify a custom port in the URL (`sftp://user@host:2222/path`) or with SCP-style using the SFTP URL format.
+
+**Notes:**
+- Server host key verification is not performed (all keys are accepted)
+- Downloads use SFTP under the hood regardless of URL scheme
+- Relative paths in SCP-style syntax (`user@host:file.txt`) are resolved relative to the user's home directory
+
 ### BitTorrent
 
 Pass a `.torrent` file path or a `magnet:` link as the argument. The downloader operates in **outbound-only** mode:
@@ -80,7 +110,7 @@ Pass a `.torrent` file path or a `magnet:` link as the argument. The downloader 
 
 This makes it safe to use on networks where torrent servers are not allowed.
 
-**Peer discovery:** HTTP/HTTPS trackers, UDP trackers (BEP 15), DHT (BEP 5).
+**Peer discovery:** HTTP/HTTPS trackers, UDP trackers (BEP 15), DHT (BEP 5), PEX (BEP 11). DHT runs continuously during download with escalating intervals, so peer discovery does not stop until the download completes.
 
 **Magnet links:** peers are found via trackers (if present in the link) and DHT. Torrent metadata is fetched from peers using the extension protocol (BEP 10) and metadata exchange (BEP 9).
 
@@ -95,6 +125,7 @@ This makes it safe to use on networks where torrent servers are not allowed.
 | `--history` | | Show download history |
 | `--clear-history` | | Clear download history |
 | `--reget URL` | | Re-download a URL from history |
+| `--verbose` | `-v` | Write detailed logs to `~/.local/share/xget/xget.log` |
 | `--completions SHELL` | | Generate shell completion script |
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |
@@ -205,6 +236,10 @@ The `.get.part` file is automatically deleted once the download completes.
 ### FTP
 
 Uses the FTP `REST` (restart) command to resume from the last byte written.
+
+### SSH
+
+Not currently supported. Re-running the command will overwrite the existing file.
 
 ### BitTorrent
 
